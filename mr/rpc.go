@@ -21,28 +21,51 @@ type ExampleArgs struct {
 type ExampleReply struct {
 	Y int
 }
-type Args struct{
-    Action string
-    // assign,
-}
-type FinishedArgs struct {
-	Id int
-	Type int
-	Result bool
-}
-type FinishedReply struct {
 
+//
+type RegisterArgs struct {
+	Sockname string
 }
-type  Reply struct {
+
+type RegisterReply struct {
+	WorkerId int
+	NReduce  int
+}
+
+type RequestArgs struct {
+	WorkerId int
+}
+
+type RequestReply struct {
+	// Map or Reduce
+	Type       string
+	MapTask    MapTask
+	ReduceTask ReduceTask
+}
+
+type TaskCompletedArgs struct {
+	Id int
+	//Map or Reduce
+	Type string
+}
+
+type TaskCompletedReply struct {
+}
+
+type Args struct {
+	Action string
+	// assign,
+}
+
+type Reply struct {
 	KeyValue
 	Id int
 	// Map :1,  Reduce: 2
-    Type     int
-	Nreduce  int
-
+	Type    int
+	Nreduce int
 }
-// Add your RPC definitions here.
 
+// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

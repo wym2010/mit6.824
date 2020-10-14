@@ -2,142 +2,107 @@ package mr
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 	"time"
+
+	"github.com/wonderivan/logger"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
-var mu *sync.Mutex
-
-type MapTask struct {
-	id       int
-	filename string
-	status   int
-	// 1: idle, 2: complete, 3: in progress
-	starttime int
+// worker host infomation  struct
+type RegistedWorker struct {
+	WorkerId int
+	Sockname string
 }
 
-type ReduceTask struct {
-	id     int
-	status int
-	// 1: idle, 2: complete, 3: in progress
-}
+//main status struct to record task status, also keep worker host information list
 type Master struct {
 	// Your definitions here.
-	maptasks      []MapTask
-	reducetasks   []ReduceTask
-	nReduce       int
-	CurrentMap    int
-	CurrentReduce int
+	mapTasks          []MapTask
+	reduceTasks       []ReduceTask
+	RegisteredWorkers []RegistedWorker
+	nReduce           int
+	currentMap        int
+	currentReduce     int
+	currentWorkerId   int
 }
 
-// Your code here -- RPC handlers for the worker to call.
+// the lock of operating the master struct
+var mu = sync.Mutex{}
 
-func (m *Master) Request(args *Args, reply *Reply) error {
-	fmt.Printf("in request\n")
-	defer fmt.Printf("out request\n")
+//
+
+// RPC handlers for the worker to call.
+
+func (m *Master) Request(args *RequestArgs, reply *RequestReply) error {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if !m.mapAllFinished() {
-		for i, maptask := range m.maptasks {
-			// unassigned maptask found
-			if maptask.status == 1 {
-				reply.KeyValue = KeyValue{Key: maptask.filename, Value: ""}
-				// mark type as a map task
-				reply.Type = 1
-				reply.Id = m.CurrentMap
-				reply.Nreduce = m.nReduce
-				fmt.Printf("assign maptask (%d), nreduce: (%d), filename: (%s)\n", reply.Id, reply.Nreduce, reply.Key)
-				m.CurrentMap += 1
-				m.maptasks[i].status = 3
-				go func(i int) {
+	for i, maptask := range m.mapTasks {
+		// unassigned maptask found
+		if maptask.status == IDEL {
+			reply.MapTask = maptask
+			reply.Type = "Map"
+			logger.Debug("assign maptask : ", maptask, " to: ", args.WorkerId)
+			m.mapTasks[i].status = INPROGRESS
 
-					timer := time.NewTimer(time.Second * 10)
-					<-timer.C
-					mu.Lock()
-					defer mu.Unlock()
-					if m.maptasks[i].status != 2 {
-						m.maptasks[i].status = 1
-					}
-				}(i)
-				return nil
-			}
-		}
-	} else if !m.ReduceAllFinished() {
-		for i, reducetask := range m.reducetasks {
-			// unassigned reduce task found
-			if reducetask.status == 1 {
-				reply.Type = 2
-				m.reducetasks[i].status = 3
-				reply.Id = m.CurrentReduce
-				fmt.Printf("assign reduce task (%d), \n", reply.Id)
-				m.CurrentReduce += 1
-				go func(i int) {
-					timer := time.NewTimer(time.Second * 10)
-					<-timer.C
-					mu.Lock()
-					defer mu.Unlock()
-					// after 10 seconds not fnished
-					if m.reducetasks[i].status != 2 {
-						m.reducetasks[i].status = 1
-					}
-				}(i)
-				return nil
-			}
+			return nil
 		}
 	}
+	for i, reducetask := range m.reduceTasks {
+		// unassigned maptask found
+		if reducetask.status == IDEL {
+			reply.ReduceTask = reducetask
+			reply.Type = "Reduce"
+			logger.Debug("assign redude : ", reducetask, " to: ", args.WorkerId)
+			m.reduceTasks[i].status = INPROGRESS
+
+			return nil
+		}
+	}
+	reply.Type = "Finished"
+	logger.Debug("assign Finished", " to: ", args.WorkerId)
 	return nil
 }
 
-func (m *Master) Finished(args *FinishedArgs, reply *FinishedReply) error {
-	fmt.Printf("in Finished\n")
-	defer fmt.Printf("out Finished\n")
+//end of  RPC handlers for the worker to call.
+
+func (m *Master) TaskCompleted(ta *TaskCompletedArgs, tr *TaskCompletedReply) error {
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if args.Type == 1 {
-		for i, maptask := range m.maptasks {
+	if ta.Type == "Map" {
+		for i, maptask := range m.mapTasks {
 
-			maptaskid := maptask.id
-			if maptaskid == args.Id {
-				if args.Result {
-					m.maptasks[i].status = 2
-				} else {
-					m.maptasks[i].status = 1
-				}
+			if maptask.id == ta.Id && maptask.status == INPROGRESS {
+				m.mapTasks[i].status = COMPLETE
 				// when map task finished, create reduce tasks
-				if m.mapAllFinished() {
-					index := 0
-					for ; index < m.nReduce; index++ {
-						reducetask := ReduceTask{id: index, status: 1}
-						m.reducetasks = append(m.reducetasks, reducetask)
-					}
+				isFinished := m.mapAllFinished()
+				if isFinished {
+					m.initReduceTasks()
 				}
 
 				return nil
 			}
 		}
 
-		fmt.Printf("id : %d not found for map work", args.Id)
-	} else if args.Type == 2 {
-		for i, reducetask := range m.reducetasks {
-			if reducetask.id == args.Id {
-				if args.Result {
-					m.reducetasks[i].status = 2
-				} else {
-					m.reducetasks[i].status = 1
-				}
+	} else if ta.Type == "Reduce" {
+		for i, reducetask := range m.reduceTasks {
+
+			if reducetask.id == ta.Id && reducetask.status == INPROGRESS {
+				m.reduceTasks[i].status = COMPLETE
+				// when map task finished, create reduce tasks
 
 				return nil
 			}
 		}
-		fmt.Printf("id : %d not found for reduce work", args.Id)
+
 	} else {
 		fmt.Printf("unexpected type\n")
 	}
@@ -159,21 +124,19 @@ func (m *Master) Done() bool {
 	} // Your code here.
 }
 
+// Must be called after fetching lock
 func (m *Master) mapAllFinished() bool {
-	maptasks := m.maptasks
-	for _, maptask := range maptasks {
-		if maptask.status != 2 {
+	for _, maptask := range m.mapTasks {
+		if maptask.status != COMPLETE {
 			return false
 		}
 	}
 	return true
 }
+
 func (m *Master) ReduceAllFinished() bool {
-	mu.Lock()
-	reducetasks := m.reducetasks
-	mu.Unlock()
-	for _, reducetask := range reducetasks {
-		if reducetask.status != 2 {
+	for _, reducetask := range m.reduceTasks {
+		if reducetask.status != COMPLETE {
 			return false
 		}
 	}
@@ -186,23 +149,77 @@ func (m *Master) ReduceAllFinished() bool {
 // Nreduce is the number of reduce tasks to use.
 //
 
+func (m *Master) initReduceTasks() {
+	base := func() string {
+		return "/root/go/src/labs/main/mrworker/"
+	}
+
+	for mapX := 1; mapX < len(m.mapTasks); mapX++ {
+		files := make([]string, 0)
+		for reduceY := 1; reduceY < m.nReduce; reduceY++ {
+			file := fmt.Sprintf("mr-%d-%d", mapX, reduceY)
+			file += base()
+			files = append(files, file)
+		}
+
+		m.currentReduce += 1
+		reducetask := ReduceTask{
+			id:     m.currentReduce,
+			Files:  files,
+			status: IDEL,
+		}
+		m.reduceTasks = append(m.reduceTasks, reducetask)
+	}
+}
+
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{nReduce: nReduce}
-	mu = new(sync.Mutex)
-	// Your code here.
+	m := Master{
+		mapTasks:          nil,
+		reduceTasks:       nil,
+		RegisteredWorkers: nil,
+		nReduce:           0,
+	}
 	mu.Lock()
 	defer mu.Unlock()
 
-	m.InitMapTasks(files)
+	m.initMapTasks(files)
 
 	m.server()
+	//m.ppathpathing()
 	return &m
 }
 
-func (m *Master) InitMapTasks(files []string) {
-	for index, filename := range files {
-		maptask := MapTask{filename: filename, status: 1, id: index}
-		m.maptasks = append(m.maptasks, maptask)
+func (m *Master) initMapTasks(files []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, filename := range files {
+		file, err := os.Open(filename)
+		//Skip the file that failed to open
+		if err != nil {
+			logger.Error("an error occures when open file: ", filename)
+		} else {
+			bytes, err := ioutil.ReadAll(file)
+			if err != nil {
+				logger.Error("an error occures when readAll file: ", filename)
+			} else {
+				//Skip the file that failed to read
+
+				// Increase map count
+				m.currentMap += 1
+				maptask := MapTask{
+					id:        m.currentMap,
+					key:       filename,
+					value:     string(bytes),
+					status:    1,
+					starttime: time.Now(),
+				}
+				// Add the map task to master struct
+				m.mapTasks = append(m.mapTasks, maptask)
+			}
+		}
+		logger.Debug("mapTask is: ", m.mapTasks)
+		logger.Debug("currentMap count is :", m.currentMap)
+
 	}
 }
 
@@ -215,6 +232,7 @@ func (m *Master) server() {
 	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
 	os.Remove(sockname)
+
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
@@ -222,13 +240,21 @@ func (m *Master) server() {
 	go http.Serve(l, nil)
 }
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	log.Println("server: rpc")
-	reply.Y = args.X + 1
+// worker can call it with RPC to regiter itself
+func (m *Master) Register(args *RegisterArgs, reply *RegisterReply) error {
+	log.Println("register worker", args.Sockname)
+	//Increase worker id
+	m.currentWorkerId += 1
+
+	newWorker := RegistedWorker{
+		Sockname: args.Sockname,
+		WorkerId: m.currentWorkerId,
+	}
+	// append newly registered workers
+	m.RegisteredWorkers = append(m.RegisteredWorkers, newWorker)
+
+	reply.WorkerId = m.currentWorkerId
+	reply.NReduce = m.nReduce
+
 	return nil
 }

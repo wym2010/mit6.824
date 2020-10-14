@@ -4,20 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
+	"net/rpc"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
+
+	"github.com/wonderivan/logger"
 )
-import "log"
-import "net/rpc"
 
 type WorkerInfo struct {
-	Id         int
-	workerType int
-	// map :1 reduce: 2
-	filename string
-	Nreduce  int
+	Id int
+	//Map or Reduce
+	WorkerType string
+	Nreduce    int
 }
 
 //
@@ -26,161 +26,157 @@ type WorkerInfo struct {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	wi := WorkerInfo{
+		Id:         0,
+		WorkerType: "",
+		Nreduce:    0,
+	}
+	// Register this node to master
+	wi.Register()
 
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
+	// Request tasks in an infinite loop
 	for {
-		args := Args{Action: "AssignWork"}
-		reply := Reply{}
-		Request(&args, &reply)
-		if reply.Type != 0 {
-			go func(reply Reply) {
-				workerInfo := WorkerInfo{}
-				InitWorkerInfo(reply, &workerInfo)
-				result := DoWork(workerInfo, mapf, reducef)
-				finishedargs := FinishedArgs{Id: reply.Id, Type: reply.Type, Result: result}
-				finishedreply := FinishedReply{}
-				call("Master.Finished", &finishedargs, &finishedreply)
-			}(reply)
-		} else {
+		ra := RequestArgs{
+			WorkerId: wi.Id,
+		}
+		rr := RequestReply{}
+
+		Request(&ra, &rr)
+
+		if rr.Type == "Map" {
+			kva := mapf(rr.MapTask.key, rr.MapTask.value)
+
+			WriteToIntermedia(kva, wi.Nreduce, wi.Id)
+
+			TaskCompleted(wi)
+
+		} else if rr.Type == "Reduce" {
+
+			if 1 == useInternalSort(rr.ReduceTask.Files) {
+				kva := []KeyValue{}
+				Aggregrate(kva, rr.ReduceTask.Files)
+				sort.Sort(ByKey(kva))
+
+				DoReduce(kva, rr.ReduceTask.id, reducef)
+
+			} else {
+				//TODO
+			}
+
+		} else if rr.Type == "Finished" {
 			os.Exit(0)
 		}
 	}
 }
-func Request(pargs *Args, preply *Reply) {
-	args := Args{}
 
-	call("Master.Request", &args, preply)
-
-	log.Printf("reply.type %v reply.nreduce %v reply.id %v\n", preply.Type, preply.Nreduce, preply.Id)
-}
-func InitWorkerInfo(reply Reply, w *WorkerInfo) {
-	w.Id = reply.Id
-	w.workerType = reply.Type
-	w.Nreduce = reply.Nreduce
-	if reply.Type == 1 {
-		w.filename = reply.KeyValue.Key
-	} else if reply.Type == 2 {
-
+// Write the key value array into mr-X-Y files,
+// which is a intermediate file as input in "reduce phase"
+func WriteToIntermedia(kva []KeyValue, Nreduce int, MapTaskNum int) {
+	// initialization
+	kvaForEachNReduce := make([][]KeyValue, Nreduce)
+	for i := range kvaForEachNReduce {
+		kvaForEachNReduce[i] = make([]KeyValue, 1)
 	}
+
+	// Fill the intermediate kv array
+	for _, kv := range kva {
+		reduceTaskNum := ihash(kv.Key) % Nreduce
+		kvaForEachNReduce[reduceTaskNum] = append(kvaForEachNReduce[reduceTaskNum], kv)
+	}
+
+	//for each reduceTaskNum,
+	// write kv array to local disk
+	for reduceTaskNum := range kvaForEachNReduce {
+		tempFileName := fmt.Sprintf("mr-%d-%d", MapTaskNum, reduceTaskNum)
+		tempFile, err := ioutil.TempFile("", tempFileName)
+		tempFileFullName := tempFile.Name()
+
+		enc := json.NewEncoder(tempFile)
+		enc.Encode(kvaForEachNReduce[reduceTaskNum])
+		// To ensure that nobody observes partially written files in the presence of crashes,
+		//the MapReduce paper mentions the trick of using a temporary file and atomically renaming it
+		//once it is completely written.
+		err = os.Rename(tempFileFullName, tempFileName)
+		if err != nil {
+			logger.Error(err)
+			return
+		}
+	}
+
 }
 
-func DoWork(w WorkerInfo, mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) bool {
-
-	SetNreduce(w.Nreduce)
-
-	if w.workerType == 1 {
-		intermediate := []KeyValue{}
-		filename := w.filename
+//Aggregrate kva from intermediate files
+func Aggregrate(kva []KeyValue, files []string) {
+	for _, filename := range files {
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", filename)
+			logger.Error("in func Aggregrate open file failed")
+			return
 		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", filename)
-		}
-		file.Close()
-		kva := mapf(filename, string(content))
-		intermediate = append(intermediate, kva...)
 
-		sort.Sort(ByBucket(intermediate))
-		i := 0
-		for i < len(intermediate) {
-			j := i + 1
-			for j < len(intermediate) && ihash(intermediate[j].Key)%Nreduce == ihash(intermediate[i].Key)%Nreduce {
-				j++
-			}
-			reducegroup := []KeyValue{}
-			GroupY := ihash(intermediate[i].Key) % w.Nreduce
-			GroupX := w.Id
-			for k := i; k < j; k++ {
-				reducegroup = append(reducegroup, intermediate[k])
-			}
-			truefilename := "mr-" + strconv.Itoa(GroupX) + "-" + strconv.Itoa(GroupY)
-			file, err = ioutil.TempFile(".", "tmp.json")
-			defer file.Close()
-
-			if err != nil {
-				log.Fatal("%v\n", err)
-				return false
-			}
-			filename := file.Name()
-			enc := json.NewEncoder(file)
-			err := enc.Encode(reducegroup)
-			if err != nil {
-				log.Fatal("Encode fail! %s", filename)
-				return false
-			} else {
-				err = os.Rename(filename, truefilename)
-				if err != nil {
-					log.Fatal("%s aleady exist", truefilename)
-				}
-			}
-
-			i = j
-		}
-		return true
-
-	} else if w.workerType == 2 {
-		matches, _ := filepath.Glob("./mr-*-" + strconv.Itoa(w.Id))
-		intermediate := []KeyValue{}
-		for _, filename := range matches {
-
-			file, err := os.Open(filename)
-			defer file.Close()
-			if err != nil {
-				log.Fatal("open file %s failed", filename)
-				return false
-			}
-			dec := json.NewDecoder(file)
-			kv := []KeyValue{}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
 			if err := dec.Decode(&kv); err != nil {
-				log.Fatal("failed decode \n")
-				log.Fatal(err.Error() + "\n")
-				return false
+				break
 			}
-			intermediate = append(intermediate, kv...)
-
-		}
-		sort.Sort(ByKey(intermediate))
-
-		tempFile, err := ioutil.TempFile(".", "output.json")
-
-		if err != nil {
-			log.Fatal("create template %s failed", tempFile)
-			return false
-		}
-		mrfilename := tempFile.Name()
-
-		i := 0
-		for i < len(intermediate) {
-			j := i + 1
-			for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-				j++
-			}
-			values := []string{}
-			for k := i; k < j; k++ {
-				values = append(values, intermediate[k].Value)
-			}
-			output := reducef(intermediate[i].Key, values)
-
-			// this is the correct format for each line of Reduce output.
-			fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
-			i = j
+			kva = append(kva, kv)
 		}
 
-		tempFile.Close()
-
-		os.Rename(mrfilename, "mr-out-"+strconv.Itoa(w.Id))
-		return true
-	} else {
-		log.Fatal("wrong type %v\n", w.workerType)
-		return false
 	}
+}
+
+// Run reduce function and generate final output
+func DoReduce(intermediate []KeyValue, reduceid int, reducef func(string, []string) string) {
+
+	oname := "mr-out-"
+	oname = oname + strconv.Itoa(reduceid)
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+}
+
+func useInternalSort(files []string) int {
+	return 1
+}
+
+func Request(a *RequestArgs, r *RequestReply) {
+	call("Master.Request", a, r)
+	logger.Debug(a, r)
+
+}
+
+func TaskCompleted(wi WorkerInfo) {
+	ta := TaskCompletedArgs{
+		Id:   wi.Id,
+		Type: wi.WorkerType,
+	}
+	tr := TaskCompletedReply{}
+
+	call("Master.TaskCompleted", &ta, &tr)
+
 }
 
 //
@@ -204,6 +200,25 @@ func CallExample() {
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)
+}
+
+//Register current worker to master
+
+func (ri *WorkerInfo) Register() {
+	args := RegisterArgs{}
+	reply := RegisterReply{}
+	isSuccess := call("Master.Register", &args, &reply)
+
+	//Exit if it fails
+	if !isSuccess {
+		fmt.Println("registration failed")
+		os.Exit(1)
+	}
+	// Register this node to master Master will reply registration with a Id and Nreduce
+	ri.Nreduce = reply.NReduce
+	ri.Id = reply.WorkerId
+	fmt.Println("registration success")
+
 }
 
 //

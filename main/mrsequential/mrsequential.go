@@ -7,7 +7,7 @@ package main
 //
 
 import "fmt"
-import "../mr"
+import "labs/mr"
 import "plugin"
 import "os"
 import "log"
