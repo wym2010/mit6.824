@@ -9,19 +9,19 @@ const (
 )
 
 type MapTask struct {
-	id     int
-	key    string
-	value  string
-	status int
+	Id     int
+	Key    string
+	Value  string
+	Status int
 	// 1: idle, 2: complete, 3: in progress
-	starttime time.Time
+	Starttime time.Time
 }
 
 type ReduceTask struct {
-	id int
+	Id int
 	// Reduce intermediate file location
-	Files []string
+	IntermediaFiles []string
 
 	// 1: idle, 2: complete, 3: in progress
-	status int
+	Status int
 }

@@ -41,10 +41,11 @@ type RequestReply struct {
 	Type       string
 	MapTask    MapTask
 	ReduceTask ReduceTask
+	TaskId     int
 }
 
 type TaskCompletedArgs struct {
-	Id int
+	TaskId int
 	//Map or Reduce
 	Type string
 }

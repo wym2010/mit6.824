@@ -9,8 +9,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
-
-	"github.com/wonderivan/logger"
+	"time"
 )
 
 type WorkerInfo struct {
@@ -18,6 +17,10 @@ type WorkerInfo struct {
 	//Map or Reduce
 	WorkerType string
 	Nreduce    int
+
+	MapTask    MapTask
+	ReduceTask ReduceTask
+	TaskId     int
 }
 
 //
@@ -30,41 +33,53 @@ func Worker(mapf func(string, string) []KeyValue,
 		Id:         0,
 		WorkerType: "",
 		Nreduce:    0,
+		TaskId:     0,
 	}
 	// Register this node to master
 	wi.Register()
 
 	// Request tasks in an infinite loop
 	for {
+
 		ra := RequestArgs{
 			WorkerId: wi.Id,
 		}
 		rr := RequestReply{}
 
-		Request(&ra, &rr)
+		call("Master.Request", &ra, &rr)
 
-		if rr.Type == "Map" {
-			kva := mapf(rr.MapTask.key, rr.MapTask.value)
+		log.Printf("Got a %s task, maptask id: %d, reduce task id: %d", rr.Type, rr.MapTask.Id, rr.ReduceTask.Id)
 
-			WriteToIntermedia(kva, wi.Nreduce, wi.Id)
+		// Save task to WorkerInfo struct
+		wi.WorkerType = rr.Type
+		wi.MapTask = rr.MapTask
+		wi.ReduceTask = rr.ReduceTask
+		wi.TaskId = rr.TaskId
+
+		switch rr.Type {
+		case "Map":
+			kva := mapf(rr.MapTask.Key, rr.MapTask.Value)
+
+			WriteToIntermedia(kva, wi.Nreduce, wi.TaskId)
 
 			TaskCompleted(wi)
-
-		} else if rr.Type == "Reduce" {
-
-			if 1 == useInternalSort(rr.ReduceTask.Files) {
+		case "Reduce":
+			if 1 == useInternalSort(rr.ReduceTask.IntermediaFiles) {
 				kva := []KeyValue{}
-				Aggregrate(kva, rr.ReduceTask.Files)
+				Aggregrate(&kva, rr.ReduceTask.IntermediaFiles)
 				sort.Sort(ByKey(kva))
 
-				DoReduce(kva, rr.ReduceTask.id, reducef)
+				DoReduce(kva, rr.ReduceTask.Id, reducef)
+				TaskCompleted(wi)
 
 			} else {
 				//TODO
 			}
-
-		} else if rr.Type == "Finished" {
+		case "Finished":
 			os.Exit(0)
+		case "Busy":
+			time.Sleep(time.Second)
+			continue
 		}
 	}
 }
@@ -73,32 +88,32 @@ func Worker(mapf func(string, string) []KeyValue,
 // which is a intermediate file as input in "reduce phase"
 func WriteToIntermedia(kva []KeyValue, Nreduce int, MapTaskNum int) {
 	// initialization
-	kvaForEachNReduce := make([][]KeyValue, Nreduce)
-	for i := range kvaForEachNReduce {
-		kvaForEachNReduce[i] = make([]KeyValue, 1)
+	kvaForEachReduceTask := make([][]KeyValue, Nreduce)
+	for i := range kvaForEachReduceTask {
+		kvaForEachReduceTask[i] = make([]KeyValue, 1)
 	}
 
 	// Fill the intermediate kv array
 	for _, kv := range kva {
 		reduceTaskNum := ihash(kv.Key) % Nreduce
-		kvaForEachNReduce[reduceTaskNum] = append(kvaForEachNReduce[reduceTaskNum], kv)
+		kvaForEachReduceTask[reduceTaskNum] = append(kvaForEachReduceTask[reduceTaskNum], kv)
 	}
 
 	//for each reduceTaskNum,
 	// write kv array to local disk
-	for reduceTaskNum := range kvaForEachNReduce {
+	for reduceTaskNum := range kvaForEachReduceTask {
 		tempFileName := fmt.Sprintf("mr-%d-%d", MapTaskNum, reduceTaskNum)
-		tempFile, err := ioutil.TempFile("", tempFileName)
+		tempFile, err := ioutil.TempFile(".", tempFileName)
 		tempFileFullName := tempFile.Name()
 
 		enc := json.NewEncoder(tempFile)
-		enc.Encode(kvaForEachNReduce[reduceTaskNum])
+		enc.Encode(kvaForEachReduceTask[reduceTaskNum])
 		// To ensure that nobody observes partially written files in the presence of crashes,
 		//the MapReduce paper mentions the trick of using a temporary file and atomically renaming it
 		//once it is completely written.
 		err = os.Rename(tempFileFullName, tempFileName)
 		if err != nil {
-			logger.Error(err)
+			log.Fatalln(err)
 			return
 		}
 	}
@@ -106,23 +121,23 @@ func WriteToIntermedia(kva []KeyValue, Nreduce int, MapTaskNum int) {
 }
 
 //Aggregrate kva from intermediate files
-func Aggregrate(kva []KeyValue, files []string) {
+func Aggregrate(kva *[]KeyValue, files []string) {
 	for _, filename := range files {
 		file, err := os.Open(filename)
 		if err != nil {
-			logger.Error("in func Aggregrate open file failed")
+			log.Fatalln(err)
 			return
 		}
 
 		dec := json.NewDecoder(file)
-		for {
-			var kv KeyValue
+		for dec.More() {
+			var kv []KeyValue
 			if err := dec.Decode(&kv); err != nil {
+				log.Fatalln(err)
 				break
 			}
-			kva = append(kva, kv)
+			*kva = append(*kva, kv...)
 		}
-
 	}
 }
 
@@ -137,6 +152,7 @@ func DoReduce(intermediate []KeyValue, reduceid int, reducef func(string, []stri
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
 	//
+
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -164,14 +180,14 @@ func useInternalSort(files []string) int {
 
 func Request(a *RequestArgs, r *RequestReply) {
 	call("Master.Request", a, r)
-	logger.Debug(a, r)
 
 }
 
 func TaskCompleted(wi WorkerInfo) {
+
 	ta := TaskCompletedArgs{
-		Id:   wi.Id,
-		Type: wi.WorkerType,
+		TaskId: wi.TaskId,
+		Type:   wi.WorkerType,
 	}
 	tr := TaskCompletedReply{}
 
@@ -205,19 +221,20 @@ func CallExample() {
 //Register current worker to master
 
 func (ri *WorkerInfo) Register() {
+
 	args := RegisterArgs{}
 	reply := RegisterReply{}
 	isSuccess := call("Master.Register", &args, &reply)
 
 	//Exit if it fails
 	if !isSuccess {
-		fmt.Println("registration failed")
+		log.Println("registration failed")
 		os.Exit(1)
 	}
 	// Register this node to master Master will reply registration with a Id and Nreduce
 	ri.Nreduce = reply.NReduce
 	ri.Id = reply.WorkerId
-	fmt.Println("registration success")
+	log.Println("registration success")
 
 }
 
