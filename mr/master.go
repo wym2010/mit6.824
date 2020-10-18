@@ -38,14 +38,8 @@ var mu = sync.Mutex{}
 var cond = sync.NewCond(&mu)
 
 var base = func() string {
+	return "./"
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	} else {
-
-		return home + "/go/src/labs/"
-	}
 }
 
 //
@@ -187,10 +181,10 @@ func (m *Master) ReduceAllFinished() bool {
 
 func (m *Master) initReduceTasks(base string) {
 
-	for mapX := 1; mapX < len(m.mapTasks); mapX++ {
+	for reduceY := 0; reduceY < m.nReduce; reduceY++ {
 		files := make([]string, 0)
-		for reduceY := 1; reduceY < m.nReduce; reduceY++ {
-			file := fmt.Sprintf("mr-%d-%d", mapX, reduceY)
+		for mapX := 0; mapX < len(m.mapTasks); mapX++ {
+			file := fmt.Sprintf("mr-%d-%d", mapX+1, reduceY+1)
 			file = base + file
 			files = append(files, file)
 		}
@@ -216,7 +210,9 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.initMapTasks(files)
 
 	m.server()
-	//m.ppathpathing()
+
+	m.monitor()
+
 	return &m
 }
 
@@ -269,6 +265,39 @@ func (m *Master) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
+}
+
+// Start a thread that monitor timeout tasks
+func (m *Master) monitor() {
+	timeoutf := func(startTime time.Time) bool {
+		now := time.Now()
+		diff := now.Sub(startTime)
+		if diff.Seconds() > 5.0 {
+			return true
+		} else {
+			return false
+		}
+	}
+
+	go func() {
+		for {
+			mu.Lock()
+
+			for i, maptask := range m.mapTasks {
+				if maptask.Status != COMPLETE && timeoutf(maptask.Starttime) {
+					m.mapTasks[i].Status = IDEL
+				}
+
+			}
+			for i, reducetask := range m.reduceTasks {
+				if reducetask.Status != COMPLETE && timeoutf(reducetask.Starttime) {
+					m.reduceTasks[i].Status = IDEL
+				}
+			}
+			mu.Unlock()
+			time.Sleep(5 * time.Second)
+		}
+	}()
 }
 
 // worker can call it with RPC to regiter itself

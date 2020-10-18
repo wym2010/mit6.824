@@ -69,7 +69,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				Aggregrate(&kva, rr.ReduceTask.IntermediaFiles)
 				sort.Sort(ByKey(kva))
 
-				DoReduce(kva, rr.ReduceTask.Id, reducef)
+				DoReduce(kva, wi.TaskId, reducef)
 				TaskCompleted(wi)
 
 			} else {
@@ -86,28 +86,29 @@ func Worker(mapf func(string, string) []KeyValue,
 
 // Write the key value array into mr-X-Y files,
 // which is a intermediate file as input in "reduce phase"
-func WriteToIntermedia(kva []KeyValue, Nreduce int, MapTaskNum int) {
-	// initialization
-	kvaForEachReduceTask := make([][]KeyValue, Nreduce)
-	for i := range kvaForEachReduceTask {
-		kvaForEachReduceTask[i] = make([]KeyValue, 1)
+// kva is splited into Nreduce parts
+func WriteToIntermedia(kva []KeyValue, Nreduce int, X int) {
+	partitions := make([][]KeyValue, Nreduce)
+	for i := range partitions {
+		partitions[i] = make([]KeyValue, 0)
 	}
 
-	// Fill the intermediate kv array
+	// Fill in
 	for _, kv := range kva {
-		reduceTaskNum := ihash(kv.Key) % Nreduce
-		kvaForEachReduceTask[reduceTaskNum] = append(kvaForEachReduceTask[reduceTaskNum], kv)
+		Y := ihash(kv.Key) % Nreduce
+		partitions[Y] = append(partitions[Y], kv)
 	}
 
 	//for each reduceTaskNum,
 	// write kv array to local disk
-	for reduceTaskNum := range kvaForEachReduceTask {
-		tempFileName := fmt.Sprintf("mr-%d-%d", MapTaskNum, reduceTaskNum)
+	for Y := range partitions {
+		// Y start from 0, so let it start from 1
+		tempFileName := fmt.Sprintf("mr-%d-%d", X, Y+1)
 		tempFile, err := ioutil.TempFile(".", tempFileName)
 		tempFileFullName := tempFile.Name()
 
 		enc := json.NewEncoder(tempFile)
-		enc.Encode(kvaForEachReduceTask[reduceTaskNum])
+		enc.Encode(partitions[Y])
 		// To ensure that nobody observes partially written files in the presence of crashes,
 		//the MapReduce paper mentions the trick of using a temporary file and atomically renaming it
 		//once it is completely written.

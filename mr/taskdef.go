@@ -23,5 +23,6 @@ type ReduceTask struct {
 	IntermediaFiles []string
 
 	// 1: idle, 2: complete, 3: in progress
-	Status int
+	Status    int
+	Starttime time.Time
 }
